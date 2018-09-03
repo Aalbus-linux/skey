@@ -1,0 +1,479 @@
+# Merge these manually
+#
+# (But first double-check latest OpenBSD src for skey for further
+# changes)
+#
+# This diff adds features and fixes, but breaks portability
+# 1) It cleans up user input, usage, &c; take what we can of those
+# 2) It removes the config support for portable builds on macOS and
+#    linux; keep those
+# 3) adds non-portable pledge() invocations; don't add those
+
+diff -r -u skey-1.1.6/skey.c obsdskey/skey.c
+--- skey-1.1.6/skey.c	2001-05-10 10:10:49.000000000 -0600
++++ obsdskey/skey.c	2016-04-07 18:05:18.000000000 -0600
+@@ -21,40 +22,35 @@
+  *
+  */
+ 
++#include <err.h>
++#include <limits.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+-#include "config.h"
+-
+-#ifdef HAVE_ERR_H
+-#include <err.h>
+-#else
+-#include "err.h"
+-#endif
++#include <readpassphrase.h>
++#include <skey.h>
+ 
+-#include "skey.h"
++void usage();
+ 
+-void    usage __P((char *));
++extern char *__progname;
+ 
+ int
+-main(argc, argv)
+-	int	argc;
+-	char	*argv[];
++main(int argc, char *argv[])
+ {
+ 	int     n, i, cnt = 1, pass = 0, hexmode = 0;
+ 	char    passwd[SKEY_MAX_PW_LEN+1], key[SKEY_BINKEY_SIZE];
+-	char	buf[33], *seed, *slash;
++	char	buf[33], *seed, *slash, *algo;
++	const char *errstr;
++
++	if (pledge("stdio tty", NULL) == -1)
++		err(1, "pledge");
+ 
+ 	/* If we were called as otp-METHOD, set algorithm based on that */
+-	if ((slash = strrchr(argv[0], '/')))
+-	    slash++;
+-	else
+-	    slash = argv[0];
+-	if (strncmp(slash, "otp-", 4) == 0) {
+-		slash += 4;
+-		if (skey_set_algorithm(slash) == NULL)
+-			errx(1, "Unknown hash algorithm %s", slash);
++	if (strncmp(__progname, "otp-", 4) == 0) {
++		algo = __progname + 4;
++		if (skey_set_algorithm(algo) == NULL)
++			errx(1, "Unknown hash algorithm %s", algo);
+ 	}
+ 
+ 	for (i = 1; i < argc && argv[i][0] == '-' && strcmp(argv[i], "--");) {
+@@ -62,14 +58,16 @@
+ 			/* Single character switch */
+ 			switch (argv[i][1]) {
+ 			case 'n':
+-				if (i + 1 == argc)
+-					usage(argv[0]);
+-				cnt = atoi(argv[++i]);
++				if (++i == argc)
++					usage();
++				cnt = strtonum(argv[i], 1, SKEY_MAX_SEQ -1, &errstr);
++				if (errstr)
++					usage();
+ 				break;
+ 			case 'p':
+-				if (i + 1 == argc)
+-					usage(argv[0]);
+-				if (strlcpy(passwd, argv[++i], sizeof(passwd)) >=
++				if (++i == argc)
++					usage();
++				if (strlcpy(passwd, argv[i], sizeof(passwd)) >=
+ 				    sizeof(passwd))
+ 					errx(1, "Password too long");
+ 				pass = 1;
+@@ -78,60 +76,52 @@
+ 				hexmode = 1;
+ 				break;
+ 			default:
+-				usage(argv[0]);
++				usage();
+ 			}
+ 		} else {
+ 			/* Multi character switches are hash types */
+ 			if (skey_set_algorithm(&argv[i][1]) == NULL) {
+ 				warnx("Unknown hash algorithm %s", &argv[i][1]);
+-				usage(argv[0]);
++				usage();
+ 			}
+ 		}
+ 		i++;
+ 	}
+ 
+ 	if (argc > i + 2)
+-		usage(argv[0]);
++		usage();
+ 
+ 	/* Could be in the form <number>/<seed> */
+ 	if (argc <= i + 1) {
+ 		/* look for / in it */
+ 		if (argc <= i)
+-			usage(argv[0]);
++			usage();
+ 		slash = strchr(argv[i], '/');
+ 		if (slash == NULL)
+-			usage(argv[0]);
++			usage();
+ 		*slash++ = '\0';
+ 		seed = slash;
+ 
+-		if ((n = atoi(argv[i])) < 0) {
+-			warnx("%d not positive", n);
+-			usage(argv[0]);
+-		} else if (n > SKEY_MAX_SEQ) {
+-			warnx("%d is larger than max (%d)", n, SKEY_MAX_SEQ);
+-			usage(argv[0]);
++		n = strtonum(argv[i], 0, SKEY_MAX_SEQ, &errstr);
++		if (errstr) {
++			warnx("%s: %s", argv[i], errstr);
++			usage();
+ 		}
+ 	} else {
+-		if ((n = atoi(argv[i])) < 0) {
+-			warnx("%d not positive", n);
+-			usage(argv[0]);
+-		} else if (n > SKEY_MAX_SEQ) {
+-			warnx("%d is larger than max (%d)", n, SKEY_MAX_SEQ);
+-			usage(argv[0]);
++		n = strtonum(argv[i], 0, SKEY_MAX_SEQ, &errstr);
++		if (errstr) {
++			warnx("%s: %s", argv[i], errstr);
++			usage();
+ 		}
+ 		seed = argv[++i];
+ 	}
+ 
+-	/* Get user's secret password */
+-	if (!pass) {
+-		(void)fputs("Reminder - Do not use this program while logged in via telnet or rlogin.\n", stderr);
+-		(void)fputs("Enter secret password: ", stderr);
+-		readpass(passwd, sizeof(passwd));
+-		if (passwd[0] == '\0') 
+-			exit(1);
+-	}
++	/* Get user's secret passphrase */
++	if (!pass && (readpassphrase("Enter secret passphrase: ", passwd,
++	    sizeof(passwd), 0) == NULL || passwd[0] == '\0'))
++		exit(1);
+ 
+-	/* Crunch seed and password into starting key */
++	/* Crunch seed and passphrase into starting key */
+ 	if (keycrunch(key, seed, passwd) != 0)
+ 		errx(1, "key crunch failed");
+ 
+@@ -144,8 +134,7 @@
+ 			f(key);
+ 		for (; i <= n; i++) {
+ 			if (hexmode)
+-				(void)printf("%d: %-29s  %s\n", i,
+-				    btoe(buf, key), put8(buf, key));
++				(void)printf("%d: %s\n", i, put8(buf, key));
+ 			else
+ 				(void)printf("%d: %-29s\n", i, btoe(buf, key));
+ 			f(key);
+@@ -155,9 +144,10 @@
+ }
+ 
+ void
+-usage(s)
+-	char   *s;
++usage(void)
+ {
+-	(void)fprintf(stderr, "Usage: %s [-x] [-md5|-sha1|-rmd160] [-n count] [-p password] <sequence#>[/] key\n", s);
++	fprintf(stderr,
++	    "usage: %s [-x] [-md5 | -rmd160 | -sha1] [-n count]\n\t"
++	    "[-p passphrase] <sequence#>[/] key\n", __progname);
+ 	exit(1);
+ }
+diff -r -u skey-1.1.6/skeyprune.8 obsdskey/skeyprune.8
+--- skey-1.1.6/skeyprune.8	2001-05-10 10:10:49.000000000 -0600
++++ obsdskey/skeyprune.8	2015-01-07 09:39:03.000000000 -0700
+@@ -1,40 +1,72 @@
+-.\" $OpenBSD: skeyprune.8,v 1.4 1999/07/02 20:11:46 aaron Exp $
++.\" $OpenBSD: skeyprune.8,v 1.12 2014/02/12 16:58:44 schwarze Exp $
+ .\"
++.\" Copyright (c) 1996, 2001, 2002 Todd C. Miller <Todd.Miller@courtesan.com>
+ .\"
+-.Dd September 27, 1996
++.\" Permission to use, copy, modify, and distribute this software for any
++.\" purpose with or without fee is hereby granted, provided that the above
++.\" copyright notice and this permission notice appear in all copies.
++.\"
++.\" THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++.\" WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++.\" MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++.\" ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++.\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++.\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++.\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++.\"
++.Dd $Mdocdate: February 12 2014 $
+ .Dt SKEYPRUNE 8
+ .Os
+ .Sh NAME
+ .Nm skeyprune
+-.Nd prune commented out and old entries from keys file
++.Nd prune zeroed and old entries from S/Key database
+ .Sh SYNOPSIS
+ .Nm skeyprune
+ .Op Ar days
+ .Sh DESCRIPTION
+ .Nm skeyprune
+-searches through the file
+-.Dq Pa /etc/skeykeys
+-and prunes out users who have zeroed their entries via
++searches through the S/Key database,
++.Pa /etc/skey ,
++and prunes out entries that have been zeroed out via
+ .Xr skeyinit 1
+ as well as entries that have not been modified in
+ .Ar days
+-days.  If
++days.
++If
+ .Ar days
+-is not specified only commented out entries are pruned.
++is not specified, only invalid entries are pruned.
++.Pp
++If a malformed entry is encountered, or if the file mode/type is incorrect,
++an error is printed to the standard error.
+ .Sh FILES
+-.Bl -tag -width /etc/skeykeys -compact
+-.It Pa /etc/skeykeys
+-S/Key key information database
++.Bl -tag -width /etc/skey
++.It Pa /etc/skey
++directory containing S/Key user entries
++.El
++.Sh DIAGNOSTICS
++The following errors are cause for concern.
++.Bl -tag -width Ds
++.It Can't cd to /etc/skey
++The S/Key database directory,
++.Pa /etc/skey ,
++does not exist.
++The superuser may create it by running
++.Dq skeyinit -E .
++.It Can't open user
++The user's entry was found in
++.Pa /etc/skey
++but it could not be opened.
++.It user is not a regular file
++The user's entry is not a regular file.
++.It Bad mode for user
++The user's entry had a bad file mode (should be 0600).
++.It Bad link count for user.
++The user's entry had a bad link count (should be 1).
++.It Invalid entry for user
++The user's entry was not of the correct format, as specified by
++.Xr skey 5 .
+ .El
+ .Sh SEE ALSO
+ .Xr skey 1 ,
+-.Xr skeyinit 1
+-.Sh BUGS
+-Since
+-.Nm skeyprune
+-rewrites
+-.Dq Pa /etc/skeykeys ,
+-there is a window where S/Key changes could get lost.
+-It is therefore suggested that
+-.Nm skeyprune
+-be run at a time when users are unlikely to be active.
++.Xr skeyinit 1 ,
++.Xr skey 5
+diff -r -u skey-1.1.6/skeyprune.pl obsdskey/skeyprune.pl
+--- skey-1.1.6/skeyprune.pl	2001-05-10 10:10:49.000000000 -0600
++++ obsdskey/skeyprune.pl	2016-04-07 18:05:18.000000000 -0600
+@@ -1,90 +1,113 @@
+-#!/usr/bin/perl
++#!/usr/bin/perl -w
+ #
+-# Prune commented out and crufty entries from skeykeys
+-# Usage: skeyprune [days]
++# Copyright (c) 1996, 2001, 2002 Todd C. Miller <Todd.Miller@courtesan.com>
++#
++# Permission to use, copy, modify, and distribute this software for any
++# purpose with or without fee is hereby granted, provided that the above
++# copyright notice and this permission notice appear in all copies.
++#
++# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++#
++# Sponsored in part by the Defense Advanced Research Projects
++# Agency (DARPA) and Air Force Research Laboratory, Air Force
++# Materiel Command, USAF, under agreement number F39502-99-1-0512.
++#
++# Prune commented out, bogus, and crufty entries from /etc/skey
++# usage: skeyprune [days]
++#
++# $OpenBSD: skeyprune.pl,v 1.7 2015/10/06 15:06:29 tim Exp $
+ #
+-# Todd C. Miller <Todd.Miller@courtesan.com>
+-# $OpenBSD: skeyprune.pl,v 1.1 1996/09/28 00:00:41 millert Exp $
+ 
+-# We need to be able convert to time_t
+-require 'timelocal.pl';
++use POSIX qw(S_ISREG);
++use Fcntl qw(:DEFAULT :flock);
+ 
+ # Keep out the stupid
+ die "Only root may run $0.\n" if $>;
+-die "Usage: $0 [days]\n" if $#ARGC > 0;
++die "usage: $0 [days]\n" if $#ARGV > 0;
+ 
+ # Pathnames
+-$keyfile = '/etc/skeykeys';
+-$temp = "$keyfile.tmp$$";
+-
+-# Quick mapping of month name -> number
+-%months = ('Jan', 0, 'Feb', 1, 'Mar', 2, 'Apr', 3, 'May', 4,  'Jun', 5,
+-	   'Jul', 6, 'Aug', 7, 'Sep', 8, 'Oct', 9, 'Nov', 10, 'Dec', 11);
++$skeydir = '/etc/skey';
+ 
+ # Remove entries that haven't been modified in this many days.
+ $days_old = $ARGV[0] || -1;
+ 
+-# Open current key file
+-open(OLD, $keyfile) || die "$0: Can't open $keyfile: $!\n";
+-
+-# Safely open temp file
++# Safe umask
+ umask(077);
+-unlink($temp);
+-open(NEW, ">$temp") || die "$0: Can't open tempfile $temp: $!\n";
+ 
+-# We need to be extra speedy to close the window where someone can hose us.
+-setpriority(0, 0, -4);
++# Current time
++$now = time();
++
++# Slurp mode
++undef $/;
++
++chdir($skeydir) || die "$0: Can't cd to $skeydir: $!\n";
++opendir(SKEYDIR, ".") || die "$0: Can't open $skeydir: $!\n";
++while (defined($user = readdir(SKEYDIR))) {
++	next if $user =~ /^\./;
++	if (!sysopen(SKEY, $user, 0, O_RDWR | O_NONBLOCK | O_NOFOLLOW)) {
++	    warn "$0: Can't open $user: $!\n";
++	    next;
++	}
++	if (!flock(SKEY, LOCK_EX)) {
++		warn "$0: Can't lock $user: $!\n";
++		close(SKEY);
++		next;
++	}
++
++	if (!stat(SKEY)) {
++		warn "$0: Can't stat $user: $!\n";
++		close(SKEY);
++		next;
++	}
++
++	# Sanity checks.
++	if (!S_ISREG((stat(_))[2])) {
++		warn "$0: $user is not a regular file\n";
++		close(SKEY);
++		next;
++	}
++	if (((stat(_))[2] & 07777) != 0600) {
++		printf STDERR ("%s: Bad mode for %s: 0%o\n", $0, $user,
++		    (stat(_))[2]);
++		close(SKEY);
++		next;
++	}
++	if ((stat(_))[3] != 1) {
++		printf STDERR ("%s: Bad link count for %s: %d\n", $0, $user,
++		    (stat(_))[3]);
++		close(SKEY);
++		next;
++	}
+ 
+-while (<OLD>) {
+-    # Ignore commented out entries
+-    if ( ! /^#[^\s#]+\s+(MD[0-9]+\s+)?[0-9]+\s+[A-z0-9_-]+\s+[a-f0-9]+\s+(Jan|Feb|Mar|Apr|May|Ju[nl]|Aug|Sep|Oct|Nov|Dec)\s+[0-9]+,\s*[0-9]+\s+[0-9]+:[0-9]+:[0-9]+$/ ) {
+-	/((Jan|Feb|Mar|Apr|May|Ju[nl]|Aug|Sep|Oct|Nov|Dec)\s+[0-9]+,\s*[0-9]+\s+[0-9]+:[0-9]+:[0-9]+)$/;
++	# Remove zero size entries
++	if (-z _) {
++		unlink($user) || warn "$0: Can't unlink $user: $!\n";
++		close(SKEY);
++		next;
++	}
+ 
+ 	# Prune out old entries if asked to
+ 	if ($days_old > 0) {
+-	    # build up time based on date string
+-	    @date = split(/[\s,:]/, $1);
+-	    $sec = $date[5];
+-	    $min = $date[4];
+-	    $hours = $date[3];
+-	    $mday = $date[1] - 1;
+-	    $mon = $months{$date[0]};
+-	    $year = $date[2] - 1900;
+-
+-	    $now = time();
+-	    $then = &timelocal($sec,$min,$hours,$mday,$mon,$year);
+-	    if (($now - $then) / (60 * 60 * 24) - 1 <= $days_old) {
+-		print NEW $_ || do {
+-		    warn "Can't write to $temp: $!\n";
+-		    unlink($temp);
+-		};
+-	    }
+-	} else {
+-	    print NEW $_ || do {
+-		warn "Can't write to $temp: $!\n";
+-		unlink($temp);
+-	    };
++		$then = (stat(_))[9];
++		if (($now - $then) / (60 * 60 * 24) - 1 > $days_old) {
++			unlink($user) || warn "$0: Can't unlink $user: $!\n";
++			close(SKEY);
++			next;
++		}
+ 	}
+-    }
+-}
+-close(OLD);
+-close(NEW);
+ 
+-# Set owner/group/mode on tempfile and move to real location.
+-($mode, $nlink, $uid, $gid) = (stat($keyfile))[2..5];
+-if (!defined($mode)) {
+-    unlink($temp);
+-    die "$0: Unable to stat $keyfile: $!\n";
+-}
+-if (!chmod($mode, $temp)) {
+-    unlink($temp);
+-    die "$0: Unable to set mode of $temp to $mode: $!\n";
+-}
+-if (!chown($uid, $gid, $temp)) {
+-    unlink($temp);
+-    die "$0: Unable to set owner of $temp to ($uid, $gid): $!\n";
+-}
+-# Leave temp file in place if rename fails.  Might help in debugging.
+-rename($temp, $keyfile) || die "$0: Unable to rename $temp to $keyfile: $!\n";
++	# Read in the entry and check its contents.
++	$entry = <SKEY>;
++	if ($entry !~ /^\S+[\r\n]+\S+[\r\n]+\d+[\r\n]+[A-z0-9]+[\r\n]+[a-f0-9]+[\r\n]+$/) {
++		warn "$0: Invalid entry for $user:\n$entry";
++	}
+ 
++	close(SKEY);
++}
+ exit(0);
